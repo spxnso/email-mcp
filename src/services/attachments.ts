@@ -7,21 +7,43 @@
  * still bounces as ~27 MB on the wire. Rejections list every file with its
  * size so the caller can see exactly what to trim instead of decoding an
  * opaque SMTP 552 later.
+ *
+ * spxnso patch (2026-11-15): an attachment may also be given as inline base64
+ * `content` (with a required `filename`). This exists for remote/MCP clients
+ * (the server runs in a container, the client elsewhere) that share no
+ * filesystem with the server. Base64 entries are decoded once, written to a
+ * per-call temp directory, then follow the exact same size-cap and cid /
+ * contentType handling as filesystem attachments.
  */
 
-import { stat } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { mkdtemp, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 import type { AttachmentMeta } from '../types/index.js';
 
-/** An attachment request: a bare path, or a path with inline/cid metadata. */
+/**
+ * An attachment request: a bare path, a path with inline/cid metadata, or
+ * inline base64 content for remote clients without filesystem access.
+ */
 export interface AttachmentInput {
-  path: string;
-  /** Override the filename shown to the recipient (default: basename). */
+  /** Local file path — mutually exclusive with `content`. */
+  path?: string;
+  /**
+   * Base64-encoded file content — mutually exclusive with `path`. Lets a
+   * remote client attach a file even though it cannot write to the server's
+   * filesystem.
+   */
+  content?: string;
+  /**
+   * Override the filename shown to the recipient. Required with `content`
+   * (there is no path to derive a name from); defaults to the file basename
+   * with `path`.
+   */
   filename?: string;
   /** Content-ID — the HTML body references the file as src="cid:<cid>". */
   cid?: string;
-  /** Explicit MIME type when the extension would misdetect. */
+  /** Explicit MIME type when the file extension would misdetect. */
   contentType?: string;
 }
 
@@ -73,9 +95,43 @@ export async function prepareAttachments(
   maxTotalMb: number,
 ): Promise<PreparedAttachments> {
   const attachments: PreparedAttachment[] = [];
+  let tmpDir: string | undefined;
 
   for (const entry of paths) {
     const spec = typeof entry === 'string' ? { path: entry } : entry;
+
+    // spxnso patch: inline base64 content — decoded once, written to a
+    // per-call temp directory, then treated like any other file below.
+    if (spec.content !== undefined) {
+      if (spec.path !== undefined) {
+        throw new Error('Attachment: provide either path or content (base64), not both');
+      }
+      if (!spec.filename) {
+        throw new Error('Attachment: filename is required when content (base64) is used');
+      }
+      const buffer = Buffer.from(spec.content, 'base64');
+      if (buffer.length === 0) {
+        throw new Error(`Attachment is empty: ${spec.filename}`);
+      }
+      tmpDir ??= await mkdtemp(join(tmpdir(), 'email-mcp-attach-'));
+      // basename() keeps the temp write inside the temp directory even if the
+      // caller tries a name with path separators.
+      const tmpPath = join(tmpDir, basename(spec.filename));
+      await writeFile(tmpPath, buffer);
+      attachments.push({
+        filename: spec.filename,
+        path: tmpPath,
+        size: buffer.length,
+        ...(spec.cid ? { cid: spec.cid } : {}),
+        ...(spec.contentType ? { contentType: spec.contentType } : {}),
+      });
+      continue;
+    }
+
+    if (spec.path === undefined) {
+      throw new Error('Attachment: path or content (base64) is required');
+    }
+
     let info: Awaited<ReturnType<typeof stat>>;
     try {
       info = await stat(spec.path);

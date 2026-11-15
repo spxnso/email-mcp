@@ -12,19 +12,27 @@ import type SmtpService from '../services/smtp.service.js';
 import type { SentCopyResult } from '../types/index.js';
 
 /**
- * A bare path, or a path with inline/cid metadata. The object form exists for
- * HTML mail embedding images: give the file a cid and reference it in the
- * body as <img src="cid:...">.
+ * A bare path, a path with inline/cid metadata, or inline base64 content for
+ * remote clients. The object form exists for HTML mail embedding images: give
+ * the file a cid and reference it in the body as <img src="cid:...">.
  */
 export const attachmentInputSchema = z.union([
   z.string(),
   z
     .object({
-      path: z.string().describe('Local file path'),
+      path: z.string().optional().describe('Local file path (mutually exclusive with content)'),
+      content: z
+        .string()
+        .optional()
+        .describe(
+          'Base64-encoded file content — attach a file without filesystem access (mutually exclusive with path)',
+        ),
       filename: z
         .string()
         .optional()
-        .describe('Filename shown to the recipient (default: the file basename)'),
+        .describe(
+          'Filename shown to the recipient (required with content; default with path: the file basename)',
+        ),
       cid: z
         .string()
         .optional()
@@ -39,7 +47,11 @@ export const attachmentInputSchema = z.union([
     // Strict so a near-miss key fails loudly. Writing `contentId` for `cid`
     // would otherwise be dropped silently and the send would "succeed" with
     // an image that never embeds.
-    .strict(),
+    .strict()
+    // spxnso patch: exactly one source — a local path or inline base64.
+    .refine((v) => (v.path !== undefined) !== (v.content !== undefined), {
+      message: 'Provide exactly one of path or content (base64)',
+    }),
 ]);
 
 /** One result line per attachment, so the caller sees exactly what went out. */
@@ -94,7 +106,7 @@ export default function registerSendTools(
           .array(attachmentInputSchema)
           .optional()
           .describe(
-            `Files to attach: plain paths, or {path, cid, contentType, filename} objects for inline images. Sizes are checked before sending; the base64-encoded total must stay under the account's effective limit (global cap ${sendLimit.globalMb} MB; known provider or per-account limits may be stricter).`,
+            `Files to attach: {path} (or a bare path string) for local files, or {content (base64), filename, cid, contentType} to inline a file from a remote client. Sizes are checked before sending; the base64-encoded total must stay under the account's effective limit (global cap ${sendLimit.globalMb} MB; known provider or per-account limits may be stricter).`,
           ),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
@@ -176,7 +188,7 @@ export default function registerSendTools(
           .array(attachmentInputSchema)
           .optional()
           .describe(
-            `Files to attach: plain paths, or {path, cid, contentType, filename} objects for inline images. Sizes are checked before sending; the base64-encoded total must stay under the account's effective limit (global cap ${sendLimit.globalMb} MB; known provider or per-account limits may be stricter).`,
+            `Files to attach: {path} (or a bare path string) for local files, or {content (base64), filename, cid, contentType} to inline a file from a remote client. Sizes are checked before sending; the base64-encoded total must stay under the account's effective limit (global cap ${sendLimit.globalMb} MB; known provider or per-account limits may be stricter).`,
           ),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
